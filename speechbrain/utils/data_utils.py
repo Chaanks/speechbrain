@@ -530,3 +530,48 @@ def split_path(path):
     else:
         # Interpret as path to file in current directory.
         return "./", path
+
+
+def scalarize(value):
+    """Converts a namedtuple or dictionary containing tensors
+    to their scalar value
+
+    Arguments:
+    ----------
+    value: dict or namedtuple
+        a dictionary or named tuple of tensors
+
+    Returns
+    -------
+    result: dict
+        a result dictionary
+    """
+    if hasattr(value, "_asdict"):
+        value_dict = value._asdict()
+    else:
+        value_dict = value
+    return {key: item_value.item() for key, item_value in value_dict.items()}
+
+
+def detach(value):
+    """Detaches the specified object from the graph, which can be a
+    single tensor or a dictionary of tensors. Dictionaries of tensors are
+    converted recursively
+
+    Arguments
+    ---------
+    value: torch.Tensor|dict
+        a tensor or a dictionary of tensors
+
+    Returns
+    -------
+    result: torch.Tensor|dict
+        a tensor of dictionary of tensors
+    """
+    if isinstance(value, torch.Tensor):
+        result = value.detach().cpu()
+    elif isinstance(value, dict):
+        result = {key: detach(item_value) for key, item_value in value.items()}
+    else:
+        result = value
+    return result
