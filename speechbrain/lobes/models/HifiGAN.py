@@ -116,6 +116,77 @@ def mel_spectogram(
     return mel
 
 
+def process_duration(code, code_feat):
+    uniq_code_count = []
+    uniq_code_feat = []
+    for i in range(code.size(0)):
+        _, count = torch.unique_consecutive(code[i, :], return_counts=True)
+        if len(count) > 2:
+            # remove first and last code as segment sampling may cause incomplete segment length
+            uniq_code_count.append(count[1:-1])
+            uniq_code_idx = count.cumsum(dim=0)[:-2]
+        else:
+            uniq_code_count.append(count)
+            uniq_code_idx = count.cumsum(dim=0) - 1
+        uniq_code_feat.append(code_feat[i, uniq_code_idx, :].view(-1, code_feat.size(2)))
+    uniq_code_count = torch.cat(uniq_code_count)
+
+    # collate feat
+    max_len = max(feat.size(0) for feat in uniq_code_feat)
+    out = uniq_code_feat[0].new_zeros((len(uniq_code_feat), max_len, uniq_code_feat[0].size(1)))
+    mask = torch.arange(max_len).repeat(len(uniq_code_feat), 1)
+    for i, v in enumerate(uniq_code_feat):
+        out[i, : v.size(0)] = v
+        mask[i, :] = mask[i, :] < v.size(0)
+
+    return out, mask.bool(), uniq_code_count.float()
+
+
+class VariancePredictor(nn.Module):
+    def __init__(
+        self,
+        encoder_embed_dim,
+        var_pred_hidden_dim,
+        var_pred_kernel_size,
+        var_pred_dropout
+    ):
+        super().__init__()
+        self.conv1 = nn.Sequential(
+            Conv1d(
+                in_channels=encoder_embed_dim,
+                out_channels=var_pred_hidden_dim,
+                kernel_size=var_pred_kernel_size,
+                padding="same",
+                skip_transpose=True,
+                weight_norm=True,
+            ),
+            nn.ReLU()
+        )
+        #self.ln1 = nn.LayerNorm(var_pred_hidden_dim)
+        self.dropout = var_pred_dropout
+        self.conv2 = nn.Sequential(
+            Conv1d(
+                in_channels=var_pred_hidden_dim,
+                out_channels=var_pred_hidden_dim,
+                kernel_size=var_pred_kernel_size,
+                padding="same",
+                skip_transpose=True,
+                weight_norm=True,
+            ),
+            nn.ReLU()
+        )
+        #self.ln2 = nn.LayerNorm(var_pred_hidden_dim)
+        self.proj = nn.Linear(var_pred_hidden_dim, 1)
+
+    def forward(self, x):
+        # Input: B x T x C; Output: B x T
+        x = self.conv1(x.transpose(1, 2)).transpose(1, 2)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.conv2(x.transpose(1, 2)).transpose(1, 2)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        return self.proj(x).squeeze(dim=2)
+
+
 ##################################
 # Generator
 ##################################
@@ -463,6 +534,97 @@ class HifiganGenerator(torch.nn.Module):
         )
         return self.forward(c)
 
+    @staticmethod
+    def _upsample(signal, max_frames):
+        if signal.dim() == 3:
+            bsz, channels, cond_length = signal.size()
+        elif signal.dim() == 2:
+            signal = signal.unsqueeze(2)
+            bsz, channels, cond_length = signal.size()
+        else:
+            signal = signal.view(-1, 1, 1)
+            bsz, channels, cond_length = signal.size()
+
+        signal = signal.unsqueeze(3).repeat(1, 1, 1, max_frames // cond_length)
+
+        # pad zeros as needed (if signal's shape does not divide completely with max_frames)
+        reminder = (max_frames - signal.shape[2] * signal.shape[3]) // signal.shape[3]
+        if reminder > 0:
+            raise NotImplementedError('Padding condition signal - misalignment between condition features.')
+
+        signal = signal.view(bsz, channels, max_frames)
+        return signal
+
+
+class UnitHifiganGenerator(HifiganGenerator):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        resblock_type,
+        resblock_dilation_sizes,
+        resblock_kernel_sizes,
+        upsample_kernel_sizes,
+        upsample_initial_channel,
+        upsample_factors,
+        inference_padding=5,
+        cond_channels=0,
+        conv_post_bias=True,
+        num_embeddings=100,
+        embedding_dim=128,
+        duration_predictor=False,
+        var_pred_hidden_dim=128,
+        var_pred_kernel_size=3,
+        var_pred_dropout=0.5,
+        multi_speaker=False,
+        speaker_embedding=None,
+    ):
+        super().__init__(
+            in_channels,
+            out_channels,
+            resblock_type,
+            resblock_dilation_sizes,
+            resblock_kernel_sizes,
+            upsample_kernel_sizes,
+            upsample_initial_channel,
+            upsample_factors,
+            inference_padding,
+            cond_channels,
+            conv_post_bias,
+        )
+        self.unit_embedding = torch.nn.Embedding(num_embeddings, embedding_dim)
+        self.multi_speaker = multi_speaker
+        self.speaker_embedding = speaker_embedding
+        self.duration_predictor = duration_predictor
+        self.var_predictor = VariancePredictor(
+            embedding_dim,
+            var_pred_hidden_dim,
+            var_pred_kernel_size,
+            var_pred_dropout,
+        )
+
+    def forward(self, u, spk=None, g=None, stage=sb.Stage.TRAIN):
+        x = self.unit_embedding(u).transpose(1, 2)
+
+        log_dur = None
+        log_dur_pred = None
+
+        if self.duration_predictor:
+            uniq_code_feat, uniq_code_mask, dur = process_duration(
+                u, x.transpose(1, 2))
+            log_dur_pred = self.var_predictor(uniq_code_feat)
+            log_dur_pred = log_dur_pred[uniq_code_mask]
+            log_dur = torch.log(dur + 1)
+
+        if self.multi_speaker:
+            if self.speaker_embedding:
+                spk = self.speaker_embedding(spk).transpose(1, 2)
+            else:
+                spk = spk.unsqueeze(-1)
+            spk = self._upsample(spk, x.shape[-1])
+            x = torch.cat([x, spk], dim=1)
+
+        return super().forward(x), (log_dur_pred, log_dur)
 
 ##################################
 # DISCRIMINATOR
