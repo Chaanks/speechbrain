@@ -179,13 +179,12 @@ class WandBLogger(TrainLogger):
 
     def __init__(self, *args, **kwargs):
         try:
-            yaml_file = kwargs.pop("yaml_config")
-            with open(yaml_file, "r") as yaml_stream:
-                # Read yaml with ruamel to ignore bangs
-                config_dict = ruamel.yaml.YAML().load(yaml_stream)
+            # yaml_file = kwargs.pop("yaml_config")
+            # with open(yaml_file, "r") as yaml_stream:
+            #     # Read yaml with ruamel to ignore bangs
+            #     config_dict = ruamel.yaml.YAML().load(yaml_stream)
             self.run = kwargs.pop("initializer", None)(
-                *args, **kwargs, config=config_dict
-            )
+                *args, **kwargs) #, config=config_dict)
         except Exception as e:
             raise e("There was an issue with the WandB Logger initialization")
 

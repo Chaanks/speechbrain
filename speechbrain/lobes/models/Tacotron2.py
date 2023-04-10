@@ -38,11 +38,13 @@ Authors
 #
 # *****************************************************************************
 
-from math import sqrt
+from math import log, sqrt
 from speechbrain.nnet.loss.guidedattn_loss import GuidedAttentionLoss
+from speechbrain.nnet.CNN import Conv1d
 import torch
 from torch import nn
 from torch.nn import functional as F
+import numpy as np
 from collections import namedtuple
 
 
@@ -1900,3 +1902,652 @@ def mel_spectogram(
         mel = dynamic_range_compression(mel)
 
     return mel
+
+
+# Non attentive Tacotron 
+# Adapted for speech units
+
+#TODO refactor
+def process_duration(code, code_feat):
+    uniq_code_count = []
+    uniq_code_feat = []
+    for i in range(code.size(0)):
+        _, count = torch.unique_consecutive(code[i, :], return_counts=True)
+        if len(count) > 2:
+            # remove first and last code as segment sampling may cause incomplete segment length
+            uniq_code_count.append(count[1:-1])
+            uniq_code_idx = count.cumsum(dim=0)[:-2]
+        else:
+            uniq_code_count.append(count)
+            uniq_code_idx = count.cumsum(dim=0) - 1
+        uniq_code_feat.append(code_feat[i, uniq_code_idx, :].view(-1, code_feat.size(2)))
+    uniq_code_count = torch.cat(uniq_code_count)
+
+    # collate feat
+    max_len = max(feat.size(0) for feat in uniq_code_feat)
+    out = uniq_code_feat[0].new_zeros((len(uniq_code_feat), max_len, uniq_code_feat[0].size(1)))
+    mask = torch.arange(max_len).repeat(len(uniq_code_feat), 1)
+    for i, v in enumerate(uniq_code_feat):
+        out[i, : v.size(0)] = v
+        mask[i, :] = mask[i, :] < v.size(0)
+
+    return out, mask.bool(), uniq_code_count.float()
+
+
+class VariancePredictor(nn.Module):
+    def __init__(
+        self,
+        encoder_embed_dim,
+        var_pred_hidden_dim,
+        var_pred_kernel_size,
+        var_pred_dropout
+    ):
+        super().__init__()
+        self.conv1 = nn.Sequential(
+            Conv1d(
+                in_channels=encoder_embed_dim,
+                out_channels=var_pred_hidden_dim,
+                kernel_size=var_pred_kernel_size,
+                padding="same",
+                skip_transpose=True,
+                weight_norm=True,
+            ),
+            nn.ReLU()
+        )
+        #self.ln1 = nn.LayerNorm(var_pred_hidden_dim)
+        self.dropout = var_pred_dropout
+        self.conv2 = nn.Sequential(
+            Conv1d(
+                in_channels=var_pred_hidden_dim,
+                out_channels=var_pred_hidden_dim,
+                kernel_size=var_pred_kernel_size,
+                padding="same",
+                skip_transpose=True,
+                weight_norm=True,
+            ),
+            nn.ReLU()
+        )
+        #self.ln2 = nn.LayerNorm(var_pred_hidden_dim)
+        self.proj = nn.Linear(var_pred_hidden_dim, 1)
+
+    def forward(self, x):
+        # Input: B x T x C; Output: B x T
+        x = self.conv1(x.transpose(1, 2)).transpose(1, 2)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.conv2(x.transpose(1, 2)).transpose(1, 2)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        return self.proj(x).squeeze(dim=2)
+
+class GaussianUpsampling(nn.Module):
+    """
+        Non-attention Tacotron:
+            - https://arxiv.org/abs/2010.04301
+        this source code is implemenation of the ExpressiveTacotron from BridgetteSong
+            - https://github.com/BridgetteSong/ExpressiveTacotron/blob/master/model_duration.py
+    """
+    def __init__(self):
+        super(GaussianUpsampling, self).__init__()
+        self.mask_score = -1e15
+
+    def forward(self, encoder_outputs, durations, vars, input_lengths):
+        """ Gaussian upsampling
+        PARAMS
+        ------
+        encoder_outputs: Encoder outputs  [B, N, H]
+        durations: phoneme durations  [B, N]
+        vars : phoneme attended ranges [B, N]
+        input_lengths : [B]
+        RETURNS
+        -------
+        encoder_upsampling_outputs: upsampled encoder_output  [B, T, H]
+        """
+        B = encoder_outputs.size(0)
+        N = encoder_outputs.size(1)
+        T = int(torch.sum(durations, dim=1).max().item())
+        c = torch.cumsum(durations, dim=1).float() - 0.5 * durations
+        c = c.unsqueeze(2) # [B, N, 1]
+        t = torch.arange(T, device=encoder_outputs.device).expand(B, N, T).float()  # [B, N, T]
+        vars = vars.view(B, -1, 1) # [B, N, 1]
+
+
+        w_t = -0.5 * (np.log(2.0 * np.pi) + torch.log(vars) + torch.pow(t - c, 2) / vars) # [B, N, T]
+
+        input_lengths = input_lengths.cpu().numpy()
+        input_masks = ~self.get_mask_from_lengths(input_lengths, N) # [B, N]
+        input_masks = torch.tensor(input_masks, dtype=torch.bool, device=w_t.device)
+        masks = input_masks.unsqueeze(2)
+        w_t.data.masked_fill_(masks, self.mask_score)
+        w_t = F.softmax(w_t, dim=1)
+
+        encoder_upsampling_outputs = torch.bmm(w_t.transpose(1, 2), encoder_outputs)  # [B, T, encoder_hidden_size]
+
+        return encoder_upsampling_outputs
+
+
+    def get_mask_from_lengths(self, lengths, max_len=None):
+        if max_len is None:
+            max_len = max(lengths)
+        ids = np.arange(0, max_len)
+        mask = (ids < lengths.reshape(-1, 1))
+        return mask
+
+
+class DurationPredictor(nn.Module):
+    """Duration Predictor module:
+        - two stack of BiLSTM
+        - one projection layer
+    """
+    def __init__(self, encoder_embedding_dim=512, duration_embedding_dim=512, ):
+        super(DurationPredictor, self).__init__()
+        assert duration_embedding_dim%2==0, "duration_embedding_dim must be even [{}]".format(duration_embedding_dim)
+
+        self.lstm = nn.LSTM(encoder_embedding_dim,
+                            int(duration_embedding_dim/2), 2,
+                            batch_first=True, bidirectional=True)
+
+        self.proj = LinearNorm(duration_embedding_dim, 1)
+        self.relu = nn.ReLU()
+
+    def forward(self, x, input_lengths):
+        """
+            :param x: [B, N, encoder_embedding_dim]
+            :param input_lengths: [B, N]
+            :return: [B, N]
+        """
+
+        B = x.size(0)
+        N = x.size(1)
+
+        ## remove pad activations
+        input_lengths = input_lengths.cpu().numpy()
+        x = nn.utils.rnn.pack_padded_sequence(
+            x, input_lengths, batch_first=True
+        )
+
+        self.lstm.flatten_parameters()
+        outputs, _ = self.lstm(x)
+
+        outputs, _ = nn.utils.rnn.pad_packed_sequence(outputs, batch_first=True)
+
+        outputs = self.relu(self.proj(outputs))
+
+        return outputs.view(B, N)
+
+
+class RangePredictor(nn.Module):
+    """Duration Predictor module:
+        - two stack of BiLSTM
+        - one projection layer
+    """
+    def __init__(self, encoder_embedding_dim=512, duration_embedding_dim=512):
+        super(RangePredictor, self).__init__()
+        assert duration_embedding_dim%2==0, "range_lstm_dim must be even [{}]".format(duration_embedding_dim)
+
+        self.lstm = nn.LSTM(encoder_embedding_dim + 1,
+                            int(duration_embedding_dim/2), 2,
+                            batch_first=True, bidirectional=True)
+
+        self.proj = LinearNorm(duration_embedding_dim, 1)
+
+    def forward(self, x, durations, input_lengths):
+        """
+            :param x:
+            :param durations:
+            :param input_lengths:
+            :return:
+        """
+        concated_inputs = torch.cat([x, durations.unsqueeze(-1)], dim=-1)
+
+        ## remove pad activations
+        input_lengths = input_lengths.cpu().numpy()
+        concated_inputs = nn.utils.rnn.pack_padded_sequence(
+            concated_inputs, input_lengths, batch_first=True, enforce_sorted=False)
+
+        self.lstm.flatten_parameters()
+        outputs, _ = self.lstm(concated_inputs)
+
+        outputs, _ = nn.utils.rnn.pad_packed_sequence(outputs, batch_first=True)
+
+        outputs = self.proj(outputs)
+        outputs = F.softplus(outputs)
+        return outputs.squeeze()
+
+
+class PositionalEncoding(nn.Module):
+    """
+        sinusoidal positional encoding
+        https://pytorch.org/tutorials/beginner/transformer_tutorial.html
+    """
+
+    def __init__(self, d_model: int, max_len: int = 5000):
+        super().__init__()
+
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (log(10000.0) / d_model))
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        return self.pe[x]
+
+
+class NonAttentiveDecoder(nn.Module):
+    """Decoder module:
+        - Three (dropout, batch normalization, convolution)
+        - single Bidirectional LSTM
+    """
+
+    def __init__(
+        self,
+        n_mel_channels=80,
+        n_frames_per_step=1,
+        encoder_embedding_dim=1024,
+        encoder_embedding_n=2,
+        decoder_rnn_dim=1024,
+        prenet_dim=256,
+        positional_embedding_dim=32,
+        p_decoder_dropout=0.1,
+    ):
+        super().__init__()
+        self.n_mel_channels = n_mel_channels
+        self.n_frames_per_step = n_frames_per_step
+        self.encoder_embedding_dim = encoder_embedding_dim
+        self.encoder_embedding_n = encoder_embedding_n
+        self.decoder_rnn_dim = decoder_rnn_dim
+        self.prenet_dim = prenet_dim
+        self.p_decoder_dropout = p_decoder_dropout
+
+        self.prenet = Prenet(
+            n_mel_channels * n_frames_per_step, [prenet_dim, prenet_dim]
+        )
+
+        self.decoder_rnn = nn.LSTM(
+            prenet_dim + encoder_embedding_dim,
+            decoder_rnn_dim,
+            self.encoder_embedding_n,
+            batch_first=True,
+            dropout=p_decoder_dropout,
+        )
+
+        self.linear_projection = LinearNorm(
+            decoder_rnn_dim + encoder_embedding_dim,
+            n_mel_channels * n_frames_per_step,
+        )
+
+    def forward(self, encoder_concated_outputs, durations, mel_specs):
+        """ Prepares decoder inputs, i.e. mel outputs
+            PARAMS
+            ------
+            encoder_concated_outputs: [B, T, encoder_lstm_dim + positional_embedding_dim]
+            input_lengths : [B, N]
+            mel_specs : [B, n_mel_channels, T]
+            mel_length : [B, ]
+            RETURNS
+            -------
+            predicted_mel_specs: processed decoder mel_specs
+        """
+
+        B = encoder_concated_outputs.size(0)
+
+        # [B, n_mel_channels, T-1]
+        guided_mel_specs = mel_specs[:, :, :-1]
+
+        ## dummy mel_spec input must be zeros
+        dummy_spec = torch.zeros(B, self.n_mel_channels, 1, device=guided_mel_specs.device)  # [B, n_mel_channels, 1]
+
+        guided_mel_specs = torch.cat([dummy_spec, guided_mel_specs], dim=2)  # [B, n_mel_channels, T]
+
+        # [B, n_mel_channels, T] -> [B, T, n_mel_channels]
+        guided_mel_specs = guided_mel_specs.transpose(1, 2)
+
+        prenet_outputs = self.prenet(guided_mel_specs).transpose(1, 2) # [B, T, prenet_dim]
+
+        print(prenet_outputs.shape)
+        print(encoder_concated_outputs.shape)
+
+        concated_prenet_outputs = torch.cat([prenet_outputs, encoder_concated_outputs], dim=2)
+
+        ## remove pad activations
+
+        # concated_prenet_outputs = nn.utils.rnn.pad_packed_sequence.pack_padded_sequence(
+        #     concated_prenet_outputs, durations.long().sum(dim=1).detach().cpu(), batch_first=True, enforce_sorted=False)
+
+        # self.decoder_lstm.flatten_parameters()
+        # decoder_lstm_outputs, _ = self.decoder_lstm(concated_prenet_outputs) # [B, T, decoder_lstm_dim]
+
+        # decoder_lstm_outputs, _ = nn.utils.rnn.pad_packed_sequence.pad_packed_sequence(
+        #     decoder_lstm_outputs, batch_first=True)
+
+        # concated_decoder_lstm_outputs = torch.cat([decoder_lstm_outputs, encoder_concated_outputs], dim=2) # [B, T, decoder_lstm_dim + encoder_lstm_dim + positional_embedding_dim]
+
+        # predicted_mel_specs = self.linear_projection(concated_decoder_lstm_outputs) # [B, T, n_mel_channels]
+        # predicted_mel_specs = predicted_mel_specs.transpose(1, 2) # [B, n_mel_channels, T]
+
+        return predicted_mel_specs
+
+    def inference(self, encoder_concated_outputs, durations):
+        """ Prepares decoder inputs, i.e. mel outputs
+            PARAMS
+            ------
+            encoder_concated_outputs: [B, T, encoder_lstm_dim + positional_embedding_dim]
+            input_lengths : [B, N]
+            mel_specs : [B, n_mel_channels, T]
+            mel_length : [B, ]
+            RETURNS
+            -------
+            predicted_mel_specs: processed decoder mel_specs
+        """
+
+        B = encoder_concated_outputs.size(0)
+
+        ## total mel length to generate
+        total_length = durations.long().sum(dim=1).max()
+
+        ## initialization
+        ## 1. first mel_spec input must be zeors [B, 1, n_mel_channels]
+        predicted_mel_spec = torch.zeros(B, 1, self.n_mel_channels, device=encoder_concated_outputs.device)
+        ## 2. decoder_lstm_hidden, decoder_lstm_cell
+        decoder_lstm_hidden = torch.zeros(self.decoder_lstm_n, B, self.decoder_lstm_dim, device=encoder_concated_outputs.device)
+        decoder_lstm_cell = torch.zeros(self.decoder_lstm_n, B, self.decoder_lstm_dim, device=encoder_concated_outputs.device)
+
+        predicted_mel_specs = []
+        for idx in range(total_length):
+            prenet_output = self.prenet(predicted_mel_spec)  # [B, 1, prenet_dim]
+            encoder_concated_output = encoder_concated_outputs[:, idx, :].unsqueeze(1)
+            concated_prenet_output = torch.cat([prenet_output, encoder_concated_output], dim=2) # [B, 1, decoder_lstm_dim + encoder_lstm_dim + positional_embedding_dim]
+            self.decoder_lstm.flatten_parameters()
+
+            # decoder_lstm_output: [B, 1, decoder_lstm_dim]
+            decoder_lstm_output, (decoder_lstm_hidden, decoder_lstm_cell) = self.decoder_lstm(concated_prenet_output, (decoder_lstm_hidden, decoder_lstm_cell))
+
+            # concated_decoder_lstm_output : [B, 1, decoder_lstm_dim + encoder_lstm_dim + positional_embedding_dim]
+            concated_decoder_lstm_output = torch.cat([decoder_lstm_output, encoder_concated_output], dim=2)
+
+            predicted_mel_spec = self.linear_projection(concated_decoder_lstm_output)  # [B, 1, n_mel_channels]
+            predicted_mel_specs.append(predicted_mel_spec)
+
+        # predicted_mel_specs : [B, T, n_mel_channels]
+        predicted_mel_specs = torch.cat(predicted_mel_specs, dim=1)
+        predicted_mel_specs = predicted_mel_specs.transpose(1, 2)  # [B, n_mel_channels, T]
+
+        return predicted_mel_specs
+
+
+class NonAttentiveTacotron(nn.Module):
+    """
+        Non-Attentive Tacotron module:
+            - Encoder
+            - Positional Encoding
+            - Duration Predictor
+            - Range Predictor
+            - Gaussian Upsampling
+            - Decoder
+            - Postnet
+    """
+
+    def __init__(
+        self,
+        mask_padding=True,
+        n_mel_channels=80,
+        n_symbols=100,
+        symbols_embedding_dim=512,
+        encoder_kernel_size=5,
+        encoder_n_convolutions=3,
+        encoder_embedding_dim=512,
+        encoder_embedding_n=2,
+        #duration_embedding_dim=512,
+        var_pred_hidden_dim=128,
+        var_pred_kernel_size=3,
+        var_pred_dropout=0.5,
+        positional_embedding_dim= 32,
+        positional_timestep= 10000.0,
+        n_frames_per_step=1,
+        decoder_rnn_dim=1024,
+        prenet_dim=256,
+        p_decoder_dropout=0.1,
+        postnet_embedding_dim=512,
+        postnet_kernel_size=5,
+        postnet_n_convolutions=5,
+    ):
+
+        super().__init__()
+        self.mask_padding = mask_padding
+        self.n_mel_channels = n_mel_channels
+        self.n_frames_per_step = n_frames_per_step
+        self.embedding = nn.Embedding(n_symbols, symbols_embedding_dim)
+        std = sqrt(2.0 / (n_symbols + symbols_embedding_dim))
+        val = sqrt(3.0) * std  # uniform bounds for std
+        self.embedding.weight.data.uniform_(-val, val)
+        self.encoder = Encoder(
+            encoder_n_convolutions, encoder_embedding_dim, encoder_kernel_size
+        )
+
+        # self.duration_predictor = DurationPredictor(encoder_embedding_dim, duration_embedding_dim)
+        # self.range_predictor = RangePredictor(encoder_embedding_dim, duration_embedding_dim)
+        # self.gaussian_upsampling = GaussianUpsampling()
+        self.var_predictor = VariancePredictor(
+            symbols_embedding_dim,
+            var_pred_hidden_dim,
+            var_pred_kernel_size,
+            var_pred_dropout,
+        )
+
+        self.positional_embedding = PositionalEncoding(positional_embedding_dim)
+
+        self.decoder = NonAttentiveDecoder(
+            n_mel_channels,
+            n_frames_per_step,
+            encoder_embedding_dim, 
+            encoder_embedding_n, 
+            decoder_rnn_dim, 
+            prenet_dim,
+            positional_embedding_dim,
+            p_decoder_dropout,
+        )
+
+        self.postnet = Postnet(
+            n_mel_channels,
+            postnet_embedding_dim,
+            postnet_kernel_size,
+            postnet_n_convolutions,
+        )
+
+    def get_positional_embedding(self, durations):
+        """
+            :param durations: [B, N]
+            :return positional_embedding_outputs: [B, T, positional_hidden]
+        """
+
+        B = durations.size(0)
+        N = durations.size(1)
+
+        pos_durations = durations.long()
+        sum_len = pos_durations.sum(dim=1)
+        max_len = sum_len.max()
+        diff_len = max_len - sum_len
+        pos_durations[:, -1] = pos_durations[:, -1] + diff_len
+
+        ids = torch.arange(max_len, device=durations.device).expand(B, N, max_len)
+        pos_mask = (ids < pos_durations.view(B, N, 1))
+        pos_ids = ids[pos_mask].view(-1, max_len)  # [B, T]
+        positional_embedding_outputs = self.positional_embedding(pos_ids)
+
+        return positional_embedding_outputs
+
+    def forward(self, inputs, alignments_dim=None):
+        """
+            :param input_ids: token ids corresponding to input sentences [B, N]
+            :param input_lengths: length of sentences [B]
+            :param mel_specs: log mel-spectrogram extracted from raw audio [B, T, n_mel_channels]
+            :param durations: integer duration of phonemes corresponding to mel-spectrogram length [B, N]
+            :param kwargs: extra
+        """
+        inputs, input_lengths, targets, max_len, output_lengths = inputs
+
+        print(inputs.shape)
+        print(input_lengths)
+
+        ## Encoder have 1D Conv layer
+        embedded_inputs = self.embedding(inputs).transpose(1, 2)
+        encoder_outputs = self.encoder(embedded_inputs, input_lengths)
+
+        uniq_code_feat, uniq_code_mask, durations = process_duration(inputs, encoder_outputs)
+        log_dur_pred = self.var_predictor(uniq_code_feat)
+        log_dur_pred = log_dur_pred[uniq_code_mask]
+        log_dur = torch.log(durations + 1)
+        
+        encoder_outputs = encoder_outputs.transpose(1, 2)
+        
+        print(encoder_outputs.shape)
+        # predicted_durations = self.duration_predictor(encoder_outputs, input_lengths)
+        # range_outputs = self.range_predictor(encoder_outputs, durations, input_lengths)
+        # encoder_upsampling_outputs = self.gaussian_upsampling(encoder_outputs, durations, range_outputs, input_lengths)
+
+        #positional_embedding_outputs = self.get_positional_embedding(durations)
+
+
+        #encoder_concated_outputs = torch.cat([encoder_outputs, encoder_outputs], dim=2)
+
+        # [B, T, n_mel_channels]
+        predicted_mel_specs = self.decoder(encoder_outputs, durations, targets)
+
+        # predicted_postnet_mel_specs = self.postnet(predicted_mel_specs) # [B, n_mel_channels, T]
+        # predicted_postnet_mel_specs = predicted_postnet_mel_specs + predicted_mel_specs
+
+        # return predicted_mel_specs, predicted_postnet_mel_specs, (log_dur_pred, log_dur)
+
+    def inference(self, input_ids, input_lengths=None, pace_input_ids=None, **kwargs):
+        """
+            :param input_ids: token ids corresponding to input sentences [B, N]
+            :param input_lengths: length of sentences [B]
+            :param pace_input_ids: speed rate corresponding to input sentences [B, N] : defalut = 1
+            :param kwargs: extra
+        """
+
+        ## init to one
+        if pace_input_ids is None:
+            pace_input_ids = torch.ones_like(input_ids)
+
+        ## Encoder have 1D Conv layer
+        embedded_inputs = self.embedding(input_ids)
+        encoder_outputs = self.encoder(embedded_inputs, input_lengths)
+
+        predicted_durations = self.duration_predictor(encoder_outputs, input_lengths)
+        pace_controlled_predicted_durations = pace_input_ids * predicted_durations
+
+        ## rounding predicted values
+        pace_controlled_predicted_durations = torch.round(pace_controlled_predicted_durations)
+
+        ## fullfill zoro valus to one
+        zeor_durations = pace_controlled_predicted_durations <= 0
+        pace_controlled_predicted_durations[zeor_durations] = 1
+
+        range_outputs = self.range_predictor(encoder_outputs, pace_controlled_predicted_durations, input_lengths)
+
+        encoder_upsampling_outputs = self.gaussian_upsampling(encoder_outputs, pace_controlled_predicted_durations, range_outputs, input_lengths)
+        positional_embedding_outputs = self.get_positional_embedding(pace_controlled_predicted_durations)
+        encoder_concated_outputs = torch.cat([encoder_upsampling_outputs, positional_embedding_outputs], dim=2)
+
+        # [B, T, n_mel_channels]
+        predicted_mel_specs = self.decoder.inference(encoder_concated_outputs, pace_controlled_predicted_durations)
+
+        predicted_postnet_mel_specs = self.postnet(predicted_mel_specs)  # [B, n_mel_channels, T]
+        predicted_postnet_mel_specs = predicted_postnet_mel_specs + predicted_mel_specs
+
+        return (
+            predicted_durations,
+            pace_controlled_predicted_durations,
+            predicted_mel_specs,
+            predicted_postnet_mel_specs,
+        )
+
+
+class UnitMelCollate:
+    """ Zero-pads model inputs and targets based on number of frames per step
+
+    Arguments
+    ---------
+    n_frames_per_step: int
+        the number of output frames per step
+
+    Returns
+    -------
+    result: tuple
+        a tuple of tensors to be used as inputs/targets
+        (
+            text_padded,
+            input_lengths,
+            mel_padded,
+            gate_padded,
+            output_lengths,
+            len_x
+        )
+    """
+
+    def __init__(self, n_frames_per_step=1):
+        self.n_frames_per_step = n_frames_per_step
+
+    # TODO: Make this more intuitive, use the pipeline
+    def __call__(self, batch):
+        """Collate's training batch from normalized text and mel-spectrogram
+        Arguments
+        ---------
+        batch: list
+            [unit, mel]
+        """
+
+        # TODO: Remove for loops and this dirty hack
+        raw_batch = list(batch)
+        for i in range(
+            len(batch)
+        ):  # the pipline return a dictionary wiht one elemnent
+            batch[i] = batch[i]["unit_mel_pair"]
+
+        # Right zero-pad all one-hot text sequences to max input length
+        input_lengths, ids_sorted_decreasing = torch.sort(
+            torch.LongTensor([len(x[0]) for x in batch]), dim=0, descending=True
+        )
+        max_input_len = input_lengths[0]
+
+        unit_padded = torch.LongTensor(len(batch), max_input_len)
+        unit_padded.zero_()
+        for i in range(len(ids_sorted_decreasing)):
+            unit = batch[ids_sorted_decreasing[i]][0]
+            unit_padded[i, : unit.size(0)] = unit
+
+        # Right zero-pad mel-spec
+        num_mels = batch[0][1].size(0)
+        max_target_len = max([x[1].size(1) for x in batch])
+        if max_target_len % self.n_frames_per_step != 0:
+            max_target_len += (
+                self.n_frames_per_step - max_target_len % self.n_frames_per_step
+            )
+            assert max_target_len % self.n_frames_per_step == 0
+
+        # include mel padded and gate padded
+        mel_padded = torch.FloatTensor(len(batch), num_mels, max_target_len)
+        mel_padded.zero_()
+        output_lengths = torch.LongTensor(len(batch))
+        uttid, wavs = [], []
+        for i in range(len(ids_sorted_decreasing)):
+            idx = ids_sorted_decreasing[i]
+            mel = batch[idx][1]
+            mel_padded[i, :, : mel.size(1)] = mel
+            output_lengths[i] = mel.size(1)
+            uttid.append(raw_batch[idx]["id"])
+            wavs.append(raw_batch[idx]["wav"])
+
+        # count number of items - characters in unit
+        len_x = [x[2] for x in batch]
+        len_x = torch.Tensor(len_x)
+        return (
+            unit_padded,
+            input_lengths,
+            mel_padded,
+            output_lengths,
+            len_x,
+            uttid,
+            wavs,
+        )

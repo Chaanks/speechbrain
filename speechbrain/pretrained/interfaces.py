@@ -11,6 +11,8 @@ Authors:
 import logging
 import hashlib
 import sys
+import pickle
+import pathlib as pl
 import speechbrain
 import torch
 import torchaudio
@@ -2835,3 +2837,143 @@ class HIFIGAN(Pretrained):
     def forward(self, spectrogram):
         "Decodes the input spectrograms"
         return self.decode_batch(spectrogram)
+
+
+class UnitHIFIGAN(Pretrained):
+    HPARAMS_NEEDED = ["generator"]
+
+    """
+    A ready-to-use wrapper for HiFiGAN (discrete units -> waveform).
+
+    Arguments
+    ---------
+    hparams
+        Hyperparameters (from HyperPyYAML)
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.infer = self.hparams.generator.inference
+        self.first_call = True
+
+    def decode_batch(self, unit, spk=None):
+        """Computes waveforms from a batch of discrete units
+
+        Arguments
+        ---------
+        unit: torch.tensor
+            Batch of discrete units [batch, units]
+        spk: torch.tensor
+            Batch of spks [batch, spk_dim]
+
+        Returns
+        -------
+        waveforms: torch.tensor
+            Batch of mel-waveforms [batch, 1, time]
+
+        """
+        # Prepare for inference by removing the weight norm
+        if self.first_call:
+            self.hparams.generator.remove_weight_norm()
+            self.first_call = False
+        with torch.no_grad():
+            if spk:
+                spk.to(self.device)
+            waveform = self.infer(unit.to(self.device), spk=spk)
+        return waveform
+
+    def decode_unit(self, unit, f0=None, spk=None, emo=None):
+        """Computes waveforms from a single sequence of discrite units
+
+        Arguments
+        ---------
+        unit: torch.tensor
+            unit: [mels, time]
+        spk: torch.tensor
+            spk: [spk_dim]
+
+        Returns
+        -------
+        waveform: torch.tensor
+            waveform [1, time]
+
+        audio can be saved by:
+        >>> waveform = torch.rand(1, 666666)
+        >>> sample_rate = 22050
+        >>> torchaudio.save("test.wav", waveform, sample_rate)
+        """
+        # Prepare for inference by removing the weight norm
+        if self.first_call:
+            self.hparams.generator.remove_weight_norm()
+            self.first_call = False
+        with torch.no_grad():
+            if spk is not None:
+                spk = spk.unsqueeze(0).to(self.device)
+            if emo is not None:
+                emo = emo.unsqueeze(0).to(self.device)
+            if f0 is not None:
+                f0 = f0.unsqueeze(0).to(self.device)
+            waveform = self.infer(unit.unsqueeze(0).to(self.device), f0=f0, spk=spk, emo=emo)
+        return waveform.squeeze(0)
+
+    def forward(self, unit, spk=None):
+        return self.decode_batch(unit, spk)
+
+
+class PitchPredictor(Pretrained):
+    HPARAMS_NEEDED = ["model"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.infer = self.hparams.model.inference
+        self.first_call = True
+
+    def set_f0_processor(self, f0_processor_ckpt):
+        f0_processor_ckpt = pl.Path(f0_processor_ckpt)
+        if f0_processor_ckpt.exists():
+            print(f"Load f0 processor")
+            with open(f0_processor_ckpt, 'rb') as f:
+                f0_processor = pickle.load(f)
+        else:
+            print("Failed to find f0 processor ckpt")
+
+        # self.hparams.model.f0_min = f0_processor.f0_min
+        # self.hparams.model.f0_max = f0_processor.f0_max
+        # self.hparams.model.f0_bins = f0_processor.f0_bins
+        # self.hparams.model.speaker_stats = f0_processor.speaker_stats
+        self.hparams.model.setup_f0_stats(f0_processor.f0_min, f0_processor.f0_max, f0_processor.f0_bins, f0_processor.speaker_stats)
+
+    def predict(self, unit, spk_id=None, spk=None, emo=None):
+        # Prepare for inference by removing the weight norm
+        if self.first_call:
+            if not self.hparams.model.speaker_stats:
+                print("You need to setup f0 processor")
+            self.first_call = False
+        with torch.no_grad():
+            if spk is not None:
+                spk = spk.unsqueeze(0).to(self.device)
+            if emo is not None:
+                emo = emo.unsqueeze(0).to(self.device)
+            F0 = self.infer(unit.unsqueeze(0).to(self.device), spk_id=spk_id, spk=spk, emo=emo)
+        return F0.squeeze(0)
+
+    def forward(self, unit, spk_id=None, spk=None, emo=None):
+        return self.infer(unit, spk)
+
+
+class DurationPredictor(Pretrained):
+    HPARAMS_NEEDED = ["model"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.infer = self.hparams.model.inference
+
+    def predict(self, unit, emo=None):
+        with torch.no_grad():
+            if emo is not None:
+                emo = emo.unsqueeze(0).to(self.device)
+            unit = self.infer(unit.unsqueeze(0).to(self.device), emo=emo)
+        return unit.squeeze(0)
+
+    def forward(self, unit, emo=None):
+        return self.infer(unit, emo)

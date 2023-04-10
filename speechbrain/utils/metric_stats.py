@@ -152,6 +152,55 @@ class MetricStats:
             print(message)
 
 
+
+class MultiMetricStats:
+
+    def __init__(self, keys, metric, n_jobs=1, batch_eval=True):
+        self.metric_stats = {}
+        for k in keys:
+            self.metric_stats[k] = MetricStats(metric, n_jobs, batch_eval)
+
+    def append(self, keys, ids, *args, **kwargs):
+        stats = {}
+        for idx, key in enumerate(keys):
+            if not key in stats:
+                stats[key] = {
+                    "id": [],
+                    "pred": [],
+                    "target": [],
+                }
+            stats[key]["id"].append(ids[idx])
+            stats[key]["pred"].append(args[0][idx])
+            stats[key]["target"].append(args[1][idx])
+
+        for k, v in stats.items():
+            preds = torch.stack((v['pred']))
+            targets = torch.stack((v['target']))
+            self.metric_stats[k].append(v['id'], preds, targets)
+    
+    def summarize_accuracy(self, field=None):
+        summary = {}
+        for key in self.metric_stats:
+            if len(self.metric_stats[key].scores) > 0:
+                summary[key] = round(1. - self.metric_stats[key].summarize(field), 2)
+        return summary
+    
+    def summarize_error(self, field=None, reduction=None):
+        summary = {}
+        total = 0.0
+        cpt = 0
+        for key in self.metric_stats:
+            if len(self.metric_stats[key].scores) > 0:
+                summary[key] = self.metric_stats[key].summarize(field)
+                total += summary[key]
+                cpt += 1
+        if reduction == 'mean':
+            return summary, total / cpt
+        elif reduction == 'sum':
+            return summary, total
+        return summary
+
+
 def multiprocess_evaluation(metric, predict, target, lengths=None, n_jobs=8):
     """Runs metric evaluation if parallel over multiple jobs."""
     if lengths is not None:
