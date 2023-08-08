@@ -19,7 +19,7 @@ from speechbrain.dataio.dataio import (
     load_pkl,
     save_pkl,
 )
-from speechbrain.lobes.models.huggingface_wav2vec import HuggingFaceWav2Vec2
+from speechbrain.lobes.models.huggingface_whisper import HuggingFaceWhisper
 
 OPT_FILE = "opt_ljspeech_extract.pkl"
 TRAIN_JSON = "train.json"
@@ -162,12 +162,12 @@ def extract_ljspeech(
     code_folder.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"Loading encoder: {encoder} ...")
-    encoder = HuggingFaceWav2Vec2(
+    encoder = HuggingFaceWhisper(
         encoder,
         encoder_save_path.as_posix(),
+        encoder_only=True,
         output_all_hiddens=True,
-        output_norm=False,
-        freeze_feature_extractor=True,
+        freeze_encoder=True,
         freeze=True,
     ).to(device)
 
@@ -187,10 +187,11 @@ def extract_ljspeech(
                 info = torchaudio.info(wav)
                 audio = sb.dataio.dataio.read_audio(wav)
                 audio = torchaudio.transforms.Resample(
-                    info.sample_rate, sample_rate,
+                    info.sample_rate,
+                    sample_rate,
                 )(audio)
                 audio = audio.unsqueeze(0).to(device)
-                feats = encoder.extract_features(audio)
+                feats = encoder.forward_encoder(audio)
                 feats = feats[layer]
                 feats = np_array(feats)
             pred = kmeans_model.predict(feats)
