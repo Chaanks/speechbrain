@@ -424,7 +424,7 @@ def dataio_prepare(hparams):
         offsets = np.arange(num_layer) * hparams["num_clusters"]
         code = code + offsets + 1
 
-        if hparams["layer_drop"]:
+        if hparams["layer_drop"] and segment:
             num_layers_to_drop = np.random.randint(0, code.shape[1])
             if num_layers_to_drop > 0:
                 layers_to_drop = np.random.choice(

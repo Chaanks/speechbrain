@@ -15,6 +15,7 @@ import copy
 import pathlib as pl
 import random
 import sys
+import warnings
 
 import numpy as np
 import torch
@@ -79,8 +80,9 @@ class HifiGanBrain(sb.Brain):
         """
         batch = batch.to(self.device)
 
+        IDs = batch.id
         x, _ = batch.code
-        y, _ = batch.sig
+        y, y_lens = batch.sig
 
         # Hold on to the batch for the inference sample. This is needed because
         # the infernece sample is run from on_stage_end only, where
@@ -111,6 +113,18 @@ class HifiGanBrain(sb.Brain):
         loss_d = self.hparams.discriminator_loss(scores_fake, scores_real)
         loss = {**loss_g, **loss_d}
         self.last_loss_stats[stage] = scalarize(loss)
+
+        if (stage != sb.Stage.TRAIN) and self.hparams.compute_metrics:
+            if stage == sb.Stage.TEST:
+                self.dnsmos_metric.append(IDs, y_hat.squeeze(0), y_lens)
+            self.utmos_metric.append(IDs, y_hat.squeeze(0), y_lens)
+            self.dwer_metric.append(IDs, y_hat.squeeze(0), y.squeeze(0), y_lens)
+            self.wavlm_sim_metric.append(
+                IDs, y_hat.squeeze(0), y.squeeze(0), y_lens
+            )
+            self.ecapatdnn_sim_metric.append(
+                IDs, y_hat.squeeze(0), y.squeeze(0), y_lens
+            )
 
         return loss
 
@@ -236,6 +250,17 @@ class HifiGanBrain(sb.Brain):
                     "scheduler_d", self.scheduler_d
                 )
 
+    def on_stage_start(self, stage, epoch=None):
+        """Gets called at the beginning of each epoch."""
+        super().on_stage_start(stage, epoch)
+        if (stage != sb.Stage.TRAIN) and self.hparams.compute_metrics:
+            if stage == sb.Stage.TEST:
+                self.dnsmos_metric = self.hparams.dnsmos_computer()
+            self.utmos_metric = self.hparams.utmos_computer()
+            self.dwer_metric = self.hparams.dwer_computer()
+            self.wavlm_sim_metric = self.hparams.wavlm_sim_computer()
+            self.ecapatdnn_sim_metric = self.hparams.ecapatdnn_sim_computer()
+
     def on_stage_end(self, stage, stage_loss, epoch):
         """Gets called at the end of an epoch.
 
@@ -260,11 +285,30 @@ class HifiGanBrain(sb.Brain):
                 **self.last_loss_stats[sb.Stage.VALID],
             }
 
+            if self.hparams.compute_metrics:
+                stats["UTMOS"] = self.utmos_metric.summarize("average")
+                stats["dWER"] = self.dwer_metric.summarize("error_rate")
+                stats["WavLMSim"] = self.wavlm_sim_metric.summarize("average")
+                stats["ECAPATDNNSim"] = self.ecapatdnn_sim_metric.summarize(
+                    "average"
+                )
+                # Cleanup for next epoch
+                del self.utmos_metric
+                del self.dwer_metric
+                del self.wavlm_sim_metric
+                del self.ecapatdnn_sim_metric
+
             self.hparams.train_logger.log_stats(  # 1#2#
                 stats_meta={"Epoch": epoch, "lr_g": lr_g, "lr_d": lr_d},
                 train_stats=self.last_loss_stats[sb.Stage.TRAIN],
                 valid_stats=stats,
             )
+            if self.hparams.use_wandb:
+                self.hparams.wandb_logger.log_stats(
+                    stats_meta={"Epoch": epoch, "lr_g": lr_g, "lr_d": lr_d},
+                    train_stats=self.last_loss_stats[sb.Stage.TRAIN],
+                    valid_stats=stats,
+                )
             # The tensorboard_logger writes a summary to stdout and to the logfile.
             if self.hparams.use_tensorboard:
                 self.tensorboard_logger.log_stats(
@@ -298,16 +342,33 @@ class HifiGanBrain(sb.Brain):
 
             self.run_inference_sample("Valid", epoch)
 
-        # We also write statistics about test data to stdout and to the TensorboardLogger.
         if stage == sb.Stage.TEST:
+            stats = {
+                **self.last_loss_stats[sb.Stage.TEST],
+            }
+
+            if self.hparams.compute_metrics:
+                stats["DNSMOS"] = self.dnsmos_metric.summarize("average")
+                stats["UTMOS"] = self.utmos_metric.summarize("average")
+                stats["dWER"] = self.dwer_metric.summarize("error_rate")
+                stats["WavLMSim"] = self.wavlm_sim_metric.summarize("average")
+                stats["ECAPATDNNSim"] = self.ecapatdnn_sim_metric.summarize(
+                    "average"
+                )
+
             self.hparams.train_logger.log_stats(  # 1#2#
                 {"Epoch loaded": self.hparams.epoch_counter.current},
-                test_stats=self.last_loss_stats[sb.Stage.TEST],
+                test_stats=stats,
             )
+            if self.hparams.use_wandb:
+                self.hparams.wandb_logger.log_stats(
+                    {"Epoch loaded": self.hparams.epoch_counter.current},
+                    test_stats=stats,
+                )
             if self.hparams.use_tensorboard:
                 self.tensorboard_logger.log_stats(
                     {"Epoch loaded": self.hparams.epoch_counter.current},
-                    test_stats=self.last_loss_stats[sb.Stage.TEST],
+                    test_stats=stats,
                 )
             self.run_inference_sample("Test", epoch)
 
@@ -348,6 +409,27 @@ class HifiGanBrain(sb.Brain):
             )
             self.tensorboard_logger.log_figure(f"{name}/mel_target", x)
             self.tensorboard_logger.log_figure(f"{name}/mel_pred", spec_out)
+        # elif self.hparams.use_wandb:
+        #     self.hparams.wandb_logger.log_audio(
+        #         f"{name}/audio_target",
+        #         y.reshape(-1).cpu().numpy(),
+        #         self.hparams.sample_rate,
+        #         "target",
+        #         epoch,
+        #     )
+        #     self.hparams.wandb_logger.log_audio(
+        #         f"{name}/audio_pred",
+        #         sig_out.reshape(-1).cpu().numpy(),
+        #         self.hparams.sample_rate,
+        #         "pred",
+        #         epoch,
+        #     )
+        #     self.hparams.wandb_logger.log_figure(
+        #         f"{name}/mel_target", x, "mel_target", epoch
+        #     )
+        #     self.hparams.wandb_logger.log_figure(
+        #         f"{name}/mel_pred", spec_out, "mel_pred", epoch
+        #     )
         else:
             # folder name is the current epoch for validation and "test" for test
             folder = (
@@ -421,7 +503,7 @@ def dataio_prepare(hparams):
         offsets = np.arange(num_layer) * hparams["num_clusters"]
         code = code + offsets + 1
 
-        if hparams["layer_drop"]:
+        if hparams["layer_drop"] and segment:
             num_layers_to_drop = np.random.randint(0, code.shape[1])
             if num_layers_to_drop > 0:
                 layers_to_drop = np.random.choice(
@@ -471,6 +553,10 @@ if __name__ == "__main__":
 
     with open(hparams_file) as fin:
         hparams = load_hyperpyyaml(fin, overrides)
+
+    # Filter warnings
+    warnings.filterwarnings("once")
+    warnings.filterwarnings("ignore", module="torch")
 
     # If --distributed_launch then
     # create ddp_group with the right communication protocol
