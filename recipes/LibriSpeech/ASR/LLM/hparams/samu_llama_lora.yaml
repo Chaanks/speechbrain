@@ -1,0 +1,186 @@
+# ################################
+# Model: E2E ASR with SAMU and Llama3
+# Decoding: Greedy for validation, and Beam search for testing
+# Authors: Jarod Duret 2025
+# ################################
+
+# Seed needs to be set at top of yaml, before objects with parameters are made
+seed: 1000
+__set_seed: !apply:speechbrain.utils.seed_everything [!ref <seed>]
+output_folder: !ref results/train_samu_llama/<seed>
+output_wer_folder: !ref <output_folder>/
+save_folder: !ref <output_folder>/save
+train_log: !ref <output_folder>/train_log.txt
+
+
+# Data files
+data_folder: !PLACEHOLDER # e,g./path/to/LibriSpeech
+# noise/ris dataset will automatically be downloaded if uncommented
+# data_folder_rirs: !ref <data_folder>
+train_splits: ["train-clean-100"]
+# dev_splits: ["dev-clean"]
+# test_splits: ["test-clean", "test-other"]
+select_n_sentences: 100
+skip_prep: True
+ckpt_interval_minutes: 25 # save checkpoint every N min
+train_csv: !ref <output_folder>/debug.csv
+valid_csv: !ref <output_folder>/debug.csv #dev-clean.csv
+test_csv:
+   - !ref <output_folder>/test-clean.csv
+   - !ref <output_folder>/test-other.csv
+
+
+tokens_path: /local_disk/brontes/smdhaffar/librispeech_SAMU_XLSR/
+tokens_save_name: merged
+
+# LLM options
+llm_path: NousResearch/Llama-2-7b-hf # /scratch-01/llama-2/llama-2-7b-hf, or /scratch-01/llama-2/llama-2-7b-chat-hf
+llm_prompt: " Transcribe English speech to English text: "
+llm_emb_size: 4096
+lowercase: True
+pad_token: 32000
+
+####################### Training Parameters ####################################
+
+number_of_epochs: 100
+lr: 0.03 #0.0003
+lr_encoder: 0.00005
+precision: fp16 # bf16, fp16 or fp32
+
+sorting: ascending
+num_workers: 4
+
+# With data_parallel batch_size is split into N jobs
+# With DDP batch_size is multiplied by N jobs
+batch_size: 6
+test_batch_size: 8
+
+grad_accumulation_factor: 1
+loss_reduction: 'batchmean'
+
+
+dynamic_batching: True
+max_batch_length_train: 600
+max_batch_length_val: 100 # we reduce it as the beam is much wider (VRAM)
+num_bucket: 200
+shuffle: True  # if true re-creates batches at each epoch shuffling examples.
+batch_ordering: random
+max_batch_ex: 128
+
+dynamic_batch_sampler_train:
+    max_batch_length: !ref <max_batch_length_train>
+    num_buckets: !ref <num_bucket>
+    shuffle: !ref <shuffle>
+    batch_ordering: !ref <batch_ordering>
+    max_batch_ex: !ref <max_batch_ex>
+
+dynamic_batch_sampler_valid:
+    max_batch_length: !ref <max_batch_length_val>
+    num_buckets: !ref <num_bucket>
+    shuffle: !ref <shuffle>
+    batch_ordering: !ref <batch_ordering>
+    max_batch_ex: !ref <max_batch_ex>
+
+
+# Dataloader options
+train_dataloader_opts:
+    batch_size: !ref <batch_size>
+    shuffle: True
+    num_workers: !ref <num_workers>
+    collate_fn: !name:speechbrain.dataio.batch.PaddedBatch
+        padding_kwargs:
+            value: !ref <pad_token>
+
+valid_dataloader_opts:
+    batch_size: 8
+    collate_fn: !name:speechbrain.dataio.batch.PaddedBatch
+        padding_kwargs:
+            value: !ref <pad_token>
+
+test_dataloader_opts:
+    batch_size: 8
+    collate_fn: !name:speechbrain.dataio.batch.PaddedBatch
+        padding_kwargs:
+            value: !ref <pad_token>
+
+####################### Model Parameters #######################################
+
+activation: !name:torch.nn.GELU
+lora_rank: 16
+
+# Frames - LLM projector params
+dnn_layers: 2
+dnn_neurons: !ref <llm_emb_size>
+
+# Decoding parameters
+valid_search_interval: 4
+valid_beam_size: 1 # We do greedy here so it's faster to decode ...
+test_beam_size: 5
+
+############################## models ##########################################
+
+proj: !new:speechbrain.lobes.models.VanillaNN.VanillaNN
+    input_shape: [null, null, 768] # 5 x 1024
+    activation: !ref <activation>
+    dnn_blocks: !ref <dnn_layers>
+    dnn_neurons: !ref <dnn_neurons>
+
+llm: !new:speechbrain.lobes.models.huggingface_transformers.llama.LLaMA
+    source: !ref <llm_path>
+    save_path: !ref <save_folder>
+    freeze: False
+
+# Simply uncomment if you want to use LoRA adaptation.
+lora_llm: !new:speechbrain.nnet.adapters.AdaptedModel
+   model_to_adapt: !ref <llm>
+   adapter_class: !name:speechbrain.nnet.adapters.LoRA
+   all_linear: True
+   adapter_kwargs:
+       rank: !ref <lora_rank>
+
+log_softmax: !new:speechbrain.nnet.activations.Softmax
+   apply_log: True
+
+nll_loss: !name:speechbrain.nnet.losses.nll_loss
+    reduction: !ref <loss_reduction>
+
+modules:
+   llm: !ref <lora_llm>
+   proj: !ref <proj>
+
+model: !new:torch.nn.ModuleList
+   - [!ref <proj>]
+
+
+####################### Decoding & optimiser ###################################
+
+model_opt_class: !name:torch.optim.AdamW
+   lr: !ref <lr>
+   weight_decay: 0.001
+
+lr_annealing_model: !new:speechbrain.nnet.schedulers.NewBobScheduler
+   initial_value: !ref <lr>
+   improvement_threshold: 0.0025
+   annealing_factor: 0.5
+   patient: 0
+
+############################## Logging and Pretrainer ##########################
+
+checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
+   checkpoints_dir: !ref <save_folder>
+   recoverables:
+      llm: !ref <lora_llm>
+      proj: !ref <proj>
+      scheduler_model: !ref <lr_annealing_model>
+      counter: !ref <epoch_counter>
+
+train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
+   save_file: !ref <train_log>
+
+error_rate_computer: !name:speechbrain.utils.metric_stats.ErrorRateStats
+
+cer_computer: !name:speechbrain.utils.metric_stats.ErrorRateStats
+   split_tokens: True
+
+epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
+   limit: !ref <number_of_epochs>
