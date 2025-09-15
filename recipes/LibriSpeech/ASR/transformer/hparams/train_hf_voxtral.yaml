@@ -1,0 +1,193 @@
+# ################################
+# Model: Voxtral
+# Authors: Jarod Duret 2025
+# ################################
+
+# Seed needs to be set at top of yaml, before objects with parameters are made
+seed: 1986
+__set_seed: !apply:speechbrain.utils.seed_everything [!ref <seed>]
+run_name: !PLACEHOLDER
+output_folder: !ref results/<seed>/<run_name>
+output_wer_folder: !ref <output_folder>/
+save_folder: !ref <output_folder>/save
+train_log: !ref <output_folder>/train_log.txt
+
+# URL for the biggest Fairseq english voxtral model.
+voxtral_hub: mistralai/Voxtral-Mini-3B-2507
+voxtral_folder: !ref <save_folder>/voxtral_checkpoint
+voxtral_language: en
+
+
+# Data files
+data_folder: !PLACEHOLDER # e,g./path/to/LibriSpeech
+train_splits: ["train-clean-100"]
+dev_splits: ["dev-clean"]
+test_splits: ["dev-clean", "test-clean", "test-other"]
+skip_prep: True
+train_csv: !ref <output_folder>/debug.csv
+valid_csv: !ref <output_folder>/debug.csv
+test_csv:
+    - !ref <output_folder>/dev-clean.csv
+    - !ref <output_folder>/test-clean.csv
+    - !ref <output_folder>/test-other.csv
+
+ckpt_interval_minutes: 10 # save checkpoint every N min
+
+############################## Training Parameters #############################
+freeze_encoder: True
+number_of_epochs: 2
+weight_decay: 0.01
+lr_voxtral: 1e-6
+warmup_steps: 500
+max_grad_norm: 2.0
+sorting: ascending
+precision: bf16 # bf16, fp16 or fp32
+sampling_rate: 16_000
+num_workers: 4
+
+# With data_parallel batch_size is split into N jobs
+# With DDP batch_size is multiplied by N jobs
+batch_size: 16
+test_batch_size: 16
+grad_accumulation_factor: 1
+
+eos_token: 2
+bos_token: 1
+pad_token: 11
+prompt_token: -100
+
+normalized_transcripts: True
+
+####################### Model Parameters #######################################
+
+train_loader_kwargs:
+    batch_size: !ref <batch_size>
+    shuffle: False
+    num_workers: !ref <num_workers>
+    collate_fn: !name:speechbrain.dataio.batch.PaddedBatch
+        padding_kwargs: 
+            value: !ref <pad_token>
+        per_key_padding_kwargs:
+            sig:
+                value: 0
+            tokens_eos:
+                value: !ref <pad_token>
+            full_labels:
+                value: !ref <prompt_token>
+
+valid_loader_kwargs:
+    batch_size: !ref <test_batch_size>
+    num_workers: !ref <num_workers>
+    collate_fn: !name:speechbrain.dataio.batch.PaddedBatch
+        padding_kwargs: 
+            value: !ref <pad_token>
+        per_key_padding_kwargs:
+            sig:
+                value: 0
+            tokens_eos:
+                value: !ref <pad_token>
+            full_labels:
+                value: !ref <prompt_token>
+
+test_loader_kwargs:
+    batch_size: !ref <test_batch_size>
+    num_workers: !ref <num_workers>
+    collate_fn: !name:speechbrain.dataio.batch.PaddedBatch
+        padding_kwargs: 
+            value: !ref <pad_token>
+        per_key_padding_kwargs:
+            sig:
+                value: 0
+            tokens_eos:
+                value: !ref <pad_token>
+            full_labels:
+                value: -100
+
+
+epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
+    limit: !ref <number_of_epochs>
+
+############################## Augmentations ###################################
+
+# UNCOMMENT THIS SECTION TO ADD AUGMENTATIONS
+# speed_perturb: !new:speechbrain.augment.time_domain.SpeedPerturb
+#     orig_freq: !ref <sample_rate>
+#     speeds: [95, 100, 105]
+
+# # Frequency drop: randomly drops a number of frequency bands to zero.
+# drop_freq: !new:speechbrain.augment.time_domain.DropFreq
+#     drop_freq_low: 0  # Min frequency band dropout probability
+#     drop_freq_high: 1  # Max frequency band dropout probability
+#     drop_freq_count_low: 1  # Min number of frequency bands to drop
+#     drop_freq_count_high: 3  # Max number of frequency bands to drop
+#     drop_freq_width: 0.05  # Width of frequency bands to drop
+
+# # Time drop: randomly drops a number of temporal chunks.
+# drop_chunk: !new:speechbrain.augment.time_domain.DropChunk
+#     drop_length_low: 1
+#     drop_length_high: 5
+#     drop_count_low: 1000
+#     drop_count_high: 2000
+
+# # Augmenter: Combines previously defined augmentations to perform data augmentation
+# wav_augment: !new:speechbrain.augment.augmenter.Augmenter
+#     concat_original: True
+#     min_augmentations: 3
+#     max_augmentations: 3
+#     augment_prob: 1.0
+#     augmentations: [
+#         !ref <speed_perturb>,
+#         !ref <drop_freq>,
+#         !ref <drop_chunk>]
+
+############################## Models ##########################################
+
+voxtral: !new:speechbrain.integrations.huggingface.voxtral.Voxtral
+    source: !ref <voxtral_hub>
+    language: !ref <voxtral_language>
+    freeze_encoder: !ref <freeze_encoder>
+    save_path: !ref <voxtral_folder>
+    torch_dtype: bfloat16
+
+log_softmax: !new:speechbrain.nnet.activations.Softmax
+    apply_log: True
+
+nll_loss: !name:speechbrain.nnet.losses.nll_loss
+
+modules:
+    voxtral: !ref <voxtral>
+
+############################## Decoding & optimiser ############################
+
+generation_config: !new:transformers.GenerationConfig
+    num_beams: 1
+    max_new_tokens: 256
+    do_sample: False
+    pad_token_id: !ref <pad_token>
+    eos_token_id: !ref <eos_token>
+    bos_token_id: !ref <bos_token>
+
+opt_class: !name:torch.optim.AdamW
+    lr: !ref <lr_voxtral>
+    weight_decay: !ref <weight_decay>
+
+lr_annealing: !new:speechbrain.nnet.schedulers.NoamScheduler
+    lr_initial: !ref <lr_voxtral>
+    n_warmup_steps: !ref <warmup_steps>
+
+############################## Logging and Pretrainer ##########################
+
+checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
+    checkpoints_dir: !ref <save_folder>
+    recoverables:
+        voxtral: !ref <voxtral>
+        scheduler: !ref <lr_annealing>
+        counter: !ref <epoch_counter>
+
+train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
+    save_file: !ref <train_log>
+
+error_rate_computer: !name:speechbrain.utils.metric_stats.ErrorRateStats
+
+cer_computer: !name:speechbrain.utils.metric_stats.ErrorRateStats
+    split_tokens: True
