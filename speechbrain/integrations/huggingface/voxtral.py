@@ -208,7 +208,8 @@ class VoxtralProcessor(nn.Module):
         stft = torch.stft(audio_batch, self._n_fft, self._hop_length, window=window, return_complex=True)
         magnitudes = stft[..., :-1].abs() ** 2
 
-        mel_spec = self._mel_filters.to(audio_batch.device) @ magnitudes
+        mel_filters = self._mel_filters.to(audio_batch.device, dtype=magnitudes.dtype)
+        mel_spec = mel_filters @ magnitudes
         
         log_spec = torch.clamp(mel_spec, min=1e-10).log10()
         log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
@@ -349,7 +350,12 @@ class VoxtralProcessor(nn.Module):
             (processed_audio, prompt_tokens) - both without batch dimension
         """
         # Load and process audio
+        info = torchaudio.info(audio_path)
         audio = sb.dataio.dataio.read_audio(audio_path)
+        if info.sample_rate != SAMPLE_RATE:
+            audio = torchaudio.transforms.Resample(
+                info.sample_rate, SAMPLE_RATE
+            )(audio)
         
         # Process as single sample then remove batch dimension
         audio_batch = audio.unsqueeze(0)  # Add batch dim
