@@ -137,14 +137,6 @@ class ASR(sb.Brain):
         else:
             best_hyps, scores, _, _ = self.hparams.Greedysearcher(x)
             return logits_transducer, wav_lens, best_hyps
-        # else:
-        #     (
-        #         best_hyps,
-        #         best_scores,
-        #         nbest_hyps,
-        #         nbest_scores,
-        #     ) = self.hparams.Beamsearcher(x)
-        #     return logits_transducer, wav_lens, best_hyps
 
     def compute_objectives(self, predictions, batch, stage):
         """Computes the loss (Transducer+(CTC+NLL)) given predictions and targets."""
@@ -199,8 +191,12 @@ class ASR(sb.Brain):
 
         if stage != sb.Stage.TRAIN:
             # Decode token terms to words
+            # predicted_words = [
+            #     self.tokenizer.decode_ids(utt_seq).split(" ")
+            #     for utt_seq in predicted_tokens
+            # ]
             predicted_words = [
-                self.tokenizer.decode_ids(utt_seq).split(" ")
+                "".join(self.tokenizer.decode_ndim(utt_seq)).split(" ")
                 for utt_seq in predicted_tokens
             ]
             target_words = [wrd.split(" ") for wrd in batch.wrd]
@@ -341,7 +337,6 @@ def dataio_prepare(hparams):
 
     # Defining tokenizer and loading it
     # To avoid mismatch, we have to use the same tokenizer used for LM training
-    tokenizer = hparams["tokenizer"]
 
     # 2. Define audio pipeline:
     @sb.utils.data_pipeline.takes("wav")
@@ -351,15 +346,18 @@ def dataio_prepare(hparams):
         return sig
 
     sb.dataio.dataset.add_dynamic_item(datasets, audio_pipeline)
+    label_encoder = sb.dataio.encoder.CTCTextEncoder()
 
     # 3. Define text pipeline:
     @sb.utils.data_pipeline.takes("wrd")
     @sb.utils.data_pipeline.provides(
-        "wrd", "tokens_list", "tokens_bos", "tokens_eos", "tokens"
+        "wrd", "char_list", "tokens_list", "tokens_bos", "tokens_eos", "tokens"
     )
     def text_pipeline(wrd):
         yield wrd
-        tokens_list = tokenizer.encode_as_ids(wrd)
+        char_list = list(wrd)
+        yield char_list
+        tokens_list = label_encoder.encode_sequence(char_list)
         yield tokens_list
         tokens_bos = torch.LongTensor([hparams["bos_index"]] + (tokens_list))
         yield tokens_bos
@@ -370,10 +368,22 @@ def dataio_prepare(hparams):
 
     sb.dataio.dataset.add_dynamic_item(datasets, text_pipeline)
 
+    lab_enc_file = os.path.join(hparams["save_folder"], "label_encoder.txt")
+    special_labels = {
+        "blank_label": hparams["blank_index"],
+    }
+    label_encoder.load_or_create(
+        path=lab_enc_file,
+        from_didatasets=[train_data],
+        output_key="char_list",
+        special_labels=special_labels,
+        sequence_input=True,
+    )
+
     # 4. Set output:
     sb.dataio.dataset.set_output_keys(
         datasets,
-        ["id", "sig", "wrd", "tokens_bos", "tokens_eos", "tokens"],
+        ["id", "sig", "wrd", "char_list", "tokens_bos", "tokens_eos", "tokens"],
     )
 
     # 5. If Dynamic Batching is used, we instantiate the needed samplers.
@@ -407,7 +417,7 @@ def dataio_prepare(hparams):
         train_data,
         valid_data,
         test_datasets,
-        tokenizer,
+        label_encoder,
         train_batch_sampler,
         valid_batch_sampler,
     )
@@ -460,16 +470,10 @@ if __name__ == "__main__":
         train_data,
         valid_data,
         test_datasets,
-        tokenizer,
+        label_encoder,
         train_bsampler,
         valid_bsampler,
     ) = dataio_prepare(hparams)
-
-    # We download the pretrained LM and the tokenizer from HuggingFace (or elsewhere
-    # depending on the path given in the YAML file). The tokenizer is loaded at
-    # the same time.
-    hparams["pretrainer"].collect_files()
-    hparams["pretrainer"].load_collected()
 
     # Trainer initialization
     asr_brain = ASR(
@@ -480,9 +484,18 @@ if __name__ == "__main__":
         checkpointer=hparams["checkpointer"],
     )
 
+    # Load the pretrained model
+    if "pretrainer" in hparams.keys() and hparams["pt_model_path"] is not None:
+        hparams["pretrainer"].collect_files()
+        hparams["pretrainer"].load_collected()
+
     # We dynamically add the tokenizer to our brain class.
     # NB: This tokenizer corresponds to the one used for the LM!!
-    asr_brain.tokenizer = hparams["tokenizer"]
+    asr_brain.tokenizer = label_encoder
+
+    ind2lab = label_encoder.ind2lab
+    vocab_list = [ind2lab[x] for x in range(len(ind2lab))]
+
     train_dataloader_opts = hparams["train_dataloader_opts"]
     valid_dataloader_opts = hparams["valid_dataloader_opts"]
 
@@ -496,13 +509,13 @@ if __name__ == "__main__":
         valid_dataloader_opts = {"batch_sampler": valid_bsampler}
 
     # Training
-    # asr_brain.fit(
-    #     asr_brain.hparams.epoch_counter,
-    #     train_data,
-    #     valid_data,
-    #     train_loader_kwargs=train_dataloader_opts,
-    #     valid_loader_kwargs=valid_dataloader_opts,
-    # )
+    asr_brain.fit(
+        asr_brain.hparams.epoch_counter,
+        train_data,
+        valid_data,
+        train_loader_kwargs=train_dataloader_opts,
+        valid_loader_kwargs=valid_dataloader_opts,
+    )
 
     # Testing
     os.makedirs(hparams["output_wer_folder"], exist_ok=True)

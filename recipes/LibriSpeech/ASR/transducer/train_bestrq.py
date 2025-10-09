@@ -134,17 +134,17 @@ class ASR(sb.Brain):
 
             return p_ctc, p_ce, logits_transducer, wav_lens
 
-        else:
+        elif stage == sb.Stage.VALID:
             best_hyps, scores, _, _ = self.hparams.Greedysearcher(x)
             return logits_transducer, wav_lens, best_hyps
-        # else:
-        #     (
-        #         best_hyps,
-        #         best_scores,
-        #         nbest_hyps,
-        #         nbest_scores,
-        #     ) = self.hparams.Beamsearcher(x)
-        #     return logits_transducer, wav_lens, best_hyps
+        else:
+            (
+                best_hyps,
+                best_scores,
+                nbest_hyps,
+                nbest_scores,
+            ) = self.hparams.Beamsearcher(x)
+            return logits_transducer, wav_lens, best_hyps
 
     def compute_objectives(self, predictions, batch, stage):
         """Computes the loss (Transducer+(CTC+NLL)) given predictions and targets."""
@@ -496,13 +496,13 @@ if __name__ == "__main__":
         valid_dataloader_opts = {"batch_sampler": valid_bsampler}
 
     # Training
-    # asr_brain.fit(
-    #     asr_brain.hparams.epoch_counter,
-    #     train_data,
-    #     valid_data,
-    #     train_loader_kwargs=train_dataloader_opts,
-    #     valid_loader_kwargs=valid_dataloader_opts,
-    # )
+    asr_brain.fit(
+        asr_brain.hparams.epoch_counter,
+        train_data,
+        valid_data,
+        train_loader_kwargs=train_dataloader_opts,
+        valid_loader_kwargs=valid_dataloader_opts,
+    )
 
     # Testing
     os.makedirs(hparams["output_wer_folder"], exist_ok=True)

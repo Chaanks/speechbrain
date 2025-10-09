@@ -11,7 +11,7 @@
 # Seed needs to be set at top of yaml, before objects with parameters are made
 seed: 3407
 __set_seed: !apply:speechbrain.utils.seed_everything [!ref <seed>]
-output_folder: !ref results/conformer_transducer_large/<seed>
+output_folder: !ref results/conformer_transducer_large_100/<seed>
 output_wer_folder: !ref <output_folder>/
 save_folder: !ref <output_folder>/save
 train_log: !ref <output_folder>/train_log.txt
@@ -29,7 +29,7 @@ data_folder: !PLACEHOLDER # e.g, /localscratch/LibriSpeech
 # If RIRS_NOISES dir exists in /localscratch/xxx_corpus/RIRS_NOISES
 # then data_folder_rirs should be /localscratch/xxx_corpus
 # otherwise the dataset will automatically be downloaded
-train_splits: ["train-clean-100", "train-clean-360", "train-other-500"]
+train_splits: ["train-clean-100"]
 dev_splits: ["dev-clean"]
 test_splits: ["test-clean", "test-other"]
 train_csv: !ref <output_folder>/train.csv
@@ -52,7 +52,7 @@ num_workers: 4
 batch_size_valid: 4
 lr: 0.0008
 weight_decay: 0.01
-number_of_ctc_epochs: 50
+number_of_ctc_epochs: 60
 ctc_weight: 0.3 # Multitask with CTC for the encoder (0.0 = disabled)
 ce_weight: 0.0 # Multitask with CE for the decoder (0.0 = disabled)
 max_grad_norm: 5.0
@@ -109,7 +109,7 @@ test_dataloader_opts:
 # Adjust grad_accumulation_factor depending on the DDP node count (here 3)
 # Or turn it off (but training speed will decrease)
 dynamic_batching: True
-max_batch_len: 350
+max_batch_len: 150
 max_batch_len_val: 50 # we reduce it as the beam is much wider (VRAM)
 num_bucket: 200
 
