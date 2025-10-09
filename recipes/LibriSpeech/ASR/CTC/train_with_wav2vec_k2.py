@@ -30,7 +30,7 @@ import torch
 from hyperpyyaml import load_hyperpyyaml
 
 import speechbrain as sb
-import speechbrain.k2_integration as sbk2
+import speechbrain.integrations.k2_fsa as sbk2
 from speechbrain.utils.distributed import if_main_process, run_on_main
 from speechbrain.utils.logger import get_logger
 
@@ -204,7 +204,11 @@ class ASR(sb.Brain):
             )
             if if_main_process():
                 for k, stat in self.wer_metrics.items():
-                    with open(self.hparams.wer_file + f"_{k}.txt", "w") as w:
+                    with open(
+                        self.hparams.wer_file + f"_{k}.txt",
+                        "w",
+                        encoding="utf-8",
+                    ) as w:
                         stat.write_stats(w)
 
     def init_optimizers(self):
@@ -326,7 +330,7 @@ if __name__ == "__main__":
     # create ddp_group with the right communication protocol
     sb.utils.distributed.ddp_init_group(run_opts)
 
-    with open(hparams_file) as fin:
+    with open(hparams_file, encoding="utf-8") as fin:
         hparams = load_hyperpyyaml(fin, overrides)
 
     # env_corrupt is not supported with k2 yet

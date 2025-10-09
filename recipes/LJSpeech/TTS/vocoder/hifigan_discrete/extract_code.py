@@ -16,14 +16,8 @@ from tqdm import tqdm
 
 import speechbrain as sb
 from speechbrain.dataio.dataio import load_pkl, save_pkl
-from speechbrain.lobes.models.huggingface_transformers import (
-    hubert,
-    wav2vec2,
-    wavlm,
-)
-from speechbrain.lobes.models.huggingface_transformers.discrete_ssl import (
-    DiscreteSSL,
-)
+from speechbrain.integrations.huggingface import hubert, wav2vec2, wavlm
+from speechbrain.integrations.huggingface.discrete_ssl import DiscreteSSL
 from speechbrain.utils.logger import get_logger
 
 OPT_FILE = "opt_ljspeech_extract_code.pkl"
@@ -227,7 +221,7 @@ def extract_ljspeech(
     for split in splits:
         dataset_path = data_folder / f"{split}.json"
         logger.info(f"Reading dataset from {dataset_path} ...")
-        meta_json = json.load(open(dataset_path))
+        meta_json = json.load(open(dataset_path, encoding="utf-8"))
         for key in tqdm(meta_json.keys()):
             item = meta_json[key]
             wav = item["wav"]

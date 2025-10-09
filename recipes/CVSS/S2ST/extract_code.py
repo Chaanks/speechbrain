@@ -18,7 +18,7 @@ from tqdm import tqdm
 
 import speechbrain as sb
 from speechbrain.dataio.dataio import load_pkl, save_pkl
-from speechbrain.lobes.models.huggingface_transformers.wav2vec2 import Wav2Vec2
+from speechbrain.integrations.huggingface.wav2vec2 import Wav2Vec2
 from speechbrain.utils.logger import get_logger
 
 OPT_FILE = "opt_cvss_extract.pkl"
@@ -214,7 +214,7 @@ def extract_cvss(
     for split in splits:
         dataset_path = data_folder / f"{split}.json"
         logger.info(f"Reading dataset from {dataset_path} ...")
-        meta_json = json.load(open(dataset_path))
+        meta_json = json.load(open(dataset_path, encoding="utf-8"))
         for key in tqdm(meta_json.keys()):
             item = meta_json[key]
             wav = item["tgt_audio"]

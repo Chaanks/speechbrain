@@ -15,7 +15,7 @@ import torch
 from ASR_template_train import ASR, dataio_prepare
 from hyperpyyaml import load_hyperpyyaml
 from torch.utils.data import DataLoader
-from tqdm.contrib import tqdm
+from tqdm import tqdm
 
 import speechbrain as sb
 from speechbrain.dataio.dataio import read_audio  # read_audio_multichannel,
@@ -173,7 +173,7 @@ if __name__ == "__main__":
     # DDP init
     sb.utils.distributed.ddp_init_group(run_opts)
 
-    with open(hparams_file) as fin:
+    with open(hparams_file, encoding="utf-8") as fin:
         hparams = load_hyperpyyaml(fin, overrides)
 
     # Kept aside for later
@@ -235,7 +235,7 @@ if __name__ == "__main__":
     # * the pretrained ASR from the local template checkpoint - local: speechbrain/asr-crdnn-rnnlm-librispeech
 
     # === this is the only block that changed to finetune.py
-    hparams["pretrainer"].collect_files(internal_ddp_handling=True)
+    hparams["pretrainer"].collect_files()
     hparams["pretrainer"].load_collected(run_opts["device"])
     # ===
 
